@@ -1,0 +1,22 @@
+services:
+  api-server:
+    build: ./api-server
+    ports:
+      - "8080:8080"
+    environment:
+      - PORT=8080
+      - BASE_URL=http://localhost:8080
+
+  analytics:
+    build: ./analytics
+    depends_on:
+      - api-server
+    environment:
+      - API_URL=http://api-server:8080
+    command: ["report", "--api-url", "http://api-server:8080"]
+
+  cli-client:
+    build: ./cli-client
+    depends_on:
+      - api-server
+    command: ["stats", "--api-url", "http://api-server:8080"]
