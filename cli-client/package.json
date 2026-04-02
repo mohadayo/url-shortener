@@ -1,0 +1,18 @@
+{
+  "name": "url-shortener-cli",
+  "version": "1.0.0",
+  "description": "CLI client for URL Shortener service",
+  "main": "dist/index.js",
+  "bin": {
+    "urlshort": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "test": "node --test dist/index.test.js"
+  },
+  "devDependencies": {
+    "typescript": "^5.3.0",
+    "@types/node": "^20.0.0"
+  }
+}
