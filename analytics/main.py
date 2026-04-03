@@ -1,13 +1,21 @@
 """CLI entry point for the analytics service."""
 
 import argparse
+import logging
 import sys
 
 from client import APIClient
 from analyzer import generate_report, top_urls_by_clicks, extract_domains
 
+logger = logging.getLogger(__name__)
+
 
 def main():
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    )
+
     parser = argparse.ArgumentParser(description="URL Shortener Analytics")
     parser.add_argument(
         "--api-url",
@@ -26,6 +34,7 @@ def main():
     args = parser.parse_args()
 
     client = APIClient(args.api_url)
+    logger.info("Running command: %s", args.command)
 
     if args.command == "report":
         stats = client.get_stats()

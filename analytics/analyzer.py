@@ -1,12 +1,16 @@
 """Analytics module for URL shortener statistics."""
 
+import logging
 from collections import Counter
 from datetime import datetime
 from urllib.parse import urlparse
 
+logger = logging.getLogger(__name__)
+
 
 def extract_domains(entries: list[dict]) -> Counter:
     """Extract and count domains from shortened URLs."""
+    logger.info("Extracting domains from %d entries", len(entries))
     domains = Counter()
     for entry in entries:
         parsed = urlparse(entry["original_url"])
@@ -16,6 +20,7 @@ def extract_domains(entries: list[dict]) -> Counter:
 
 def top_urls_by_clicks(entries: list[dict], n: int = 10) -> list[dict]:
     """Return top N URLs sorted by click count."""
+    logger.info("Getting top %d URLs from %d entries", n, len(entries))
     sorted_entries = sorted(entries, key=lambda x: x["clicks"], reverse=True)
     return sorted_entries[:n]
 
@@ -31,6 +36,7 @@ def clicks_over_time(entries: list[dict]) -> dict[str, int]:
 
 def generate_report(stats: dict) -> str:
     """Generate a text report from stats data."""
+    logger.info("Generating analytics report")
     entries = stats.get("entries") or []
     total_urls = stats.get("total_urls", 0)
     total_clicks = stats.get("total_clicks", 0)
