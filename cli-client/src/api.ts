@@ -19,6 +19,21 @@ export interface StatsResponse {
   entries: URLEntry[];
 }
 
+function log(level: string, message: string): void {
+  const timestamp = new Date().toISOString();
+  console.error(`${timestamp} [${level}] ${message}`);
+}
+
+async function parseErrorResponse(resp: Response): Promise<string> {
+  try {
+    const body = await resp.json();
+    return body.error || `HTTP ${resp.status}`;
+  } catch {
+    const text = await resp.text().catch(() => "");
+    return text || `HTTP ${resp.status}`;
+  }
+}
+
 export class APIClient {
   private baseURL: string;
 
@@ -27,32 +42,38 @@ export class APIClient {
   }
 
   async shorten(url: string): Promise<ShortenResponse> {
+    log("INFO", `Shortening URL: ${url}`);
     const resp = await fetch(`${this.baseURL}/api/shorten`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ url }),
     });
     if (!resp.ok) {
-      const err = await resp.json();
-      throw new Error(err.error || `HTTP ${resp.status}`);
+      const errMsg = await parseErrorResponse(resp);
+      log("ERROR", `Failed to shorten URL: ${errMsg}`);
+      throw new Error(errMsg);
     }
     return resp.json();
   }
 
   async getStats(): Promise<StatsResponse> {
+    log("INFO", "Fetching global stats");
     const resp = await fetch(`${this.baseURL}/api/stats`);
     if (!resp.ok) {
-      const err = await resp.json();
-      throw new Error(err.error || `HTTP ${resp.status}`);
+      const errMsg = await parseErrorResponse(resp);
+      log("ERROR", `Failed to fetch stats: ${errMsg}`);
+      throw new Error(errMsg);
     }
     return resp.json();
   }
 
   async getURLStats(code: string): Promise<URLEntry> {
+    log("INFO", `Fetching stats for: ${code}`);
     const resp = await fetch(`${this.baseURL}/api/stats/${code}`);
     if (!resp.ok) {
-      const err = await resp.json();
-      throw new Error(err.error || `HTTP ${resp.status}`);
+      const errMsg = await parseErrorResponse(resp);
+      log("ERROR", `Failed to fetch URL stats for ${code}: ${errMsg}`);
+      throw new Error(errMsg);
     }
     return resp.json();
   }
@@ -62,6 +83,7 @@ export class APIClient {
       const resp = await fetch(`${this.baseURL}/health`);
       return resp.ok;
     } catch {
+      log("WARN", "Health check failed");
       return false;
     }
   }
