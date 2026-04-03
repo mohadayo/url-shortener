@@ -7,10 +7,13 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"sync"
 	"time"
 )
+
+const maxRequestBodySize = 1 << 20 // 1MB
 
 type URLEntry struct {
 	OriginalURL string    `json:"original_url"`
@@ -107,7 +110,26 @@ func (s *Store) GetEntry(code string) (*URLEntry, bool) {
 func writeJSON(w http.ResponseWriter, status int, data interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(data)
+	if err := json.NewEncoder(w).Encode(data); err != nil {
+		log.Printf("ERROR: failed to encode JSON response: %v", err)
+	}
+}
+
+func isValidURL(rawURL string) bool {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return false
+	}
+	return u.Scheme == "http" || u.Scheme == "https"
+}
+
+func logRequest(handler http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		log.Printf("INFO: --> %s %s", r.Method, r.URL.Path)
+		handler(w, r)
+		log.Printf("INFO: <-- %s %s (%v)", r.Method, r.URL.Path, time.Since(start))
+	}
 }
 
 func main() {
@@ -124,19 +146,22 @@ func main() {
 	mux := http.NewServeMux()
 
 	// Health check
-	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/health", logRequest(func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
-	})
+	}))
 
 	// Shorten URL
-	mux.HandleFunc("/api/shorten", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/shorten", logRequest(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 			return
 		}
 
+		r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodySize)
+
 		var req ShortenRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			log.Printf("WARN: failed to decode shorten request: %v", err)
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
 			return
 		}
@@ -146,17 +171,24 @@ func main() {
 			return
 		}
 
+		if !isValidURL(req.URL) {
+			log.Printf("WARN: invalid URL scheme rejected: %s", req.URL)
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "url must have http or https scheme"})
+			return
+		}
+
 		entry := store.Shorten(req.URL)
+		log.Printf("INFO: shortened URL %s -> %s", req.URL, entry.ShortCode)
 		resp := ShortenResponse{
 			ShortURL:    fmt.Sprintf("%s/r/%s", baseURL, entry.ShortCode),
 			ShortCode:   entry.ShortCode,
 			OriginalURL: entry.OriginalURL,
 		}
 		writeJSON(w, http.StatusCreated, resp)
-	})
+	}))
 
 	// Redirect
-	mux.HandleFunc("/r/", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/r/", logRequest(func(w http.ResponseWriter, r *http.Request) {
 		code := r.URL.Path[len("/r/"):]
 		if code == "" {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "short code required"})
@@ -165,25 +197,28 @@ func main() {
 
 		originalURL, ok := store.Resolve(code)
 		if !ok {
+			log.Printf("WARN: short code not found: %s", code)
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "short url not found"})
 			return
 		}
 
+		log.Printf("INFO: redirecting %s -> %s", code, originalURL)
 		http.Redirect(w, r, originalURL, http.StatusTemporaryRedirect)
-	})
+	}))
 
 	// Stats
-	mux.HandleFunc("/api/stats", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/stats", logRequest(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 			return
 		}
 		stats := store.GetStats()
+		log.Printf("INFO: stats requested: %d URLs, %d clicks", stats.TotalURLs, stats.TotalClicks)
 		writeJSON(w, http.StatusOK, stats)
-	})
+	}))
 
 	// Single URL stats
-	mux.HandleFunc("/api/stats/", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/stats/", logRequest(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 			return
@@ -191,11 +226,12 @@ func main() {
 		code := r.URL.Path[len("/api/stats/"):]
 		entry, ok := store.GetEntry(code)
 		if !ok {
+			log.Printf("WARN: stats for unknown short code: %s", code)
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "short url not found"})
 			return
 		}
 		writeJSON(w, http.StatusOK, entry)
-	})
+	}))
 
 	log.Printf("URL Shortener API server starting on port %s", port)
 	log.Fatal(http.ListenAndServe(":"+port, mux))
