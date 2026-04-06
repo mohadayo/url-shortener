@@ -6,11 +6,18 @@ services:
     environment:
       - PORT=8080
       - BASE_URL=http://localhost:8080
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--spider", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
 
   analytics:
     build: ./analytics
     depends_on:
-      - api-server
+      api-server:
+        condition: service_healthy
     environment:
       - API_URL=http://api-server:8080
     command: ["report", "--api-url", "http://api-server:8080"]
@@ -18,5 +25,6 @@ services:
   cli-client:
     build: ./cli-client
     depends_on:
-      - api-server
+      api-server:
+        condition: service_healthy
     command: ["stats", "--api-url", "http://api-server:8080"]
