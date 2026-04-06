@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  api-server:
+    name: api-server (Go)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: api-server
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.21"
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test
+        run: go test -v -race ./...
+
+  cli-client:
+    name: cli-client (TypeScript)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: cli-client
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Test
+        run: npm test
+
+  analytics:
+    name: analytics (Python)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: analytics
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests pytest
+
+      - name: Run tests
+        run: pytest test_analyzer.py -v
