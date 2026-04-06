@@ -79,6 +79,10 @@ func TestShortenAPI(t *testing.T) {
 		}
 		var req ShortenRequest
 		json.NewDecoder(r.Body).Decode(&req)
+		if err := validateURL(req.URL); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
 		entry := store.Shorten(req.URL)
 		resp := ShortenResponse{
 			ShortURL:    "http://localhost:8080/r/" + entry.ShortCode,
@@ -107,6 +111,79 @@ func TestShortenAPI(t *testing.T) {
 	}
 }
 
+func TestShortenAPIInvalidURL(t *testing.T) {
+	store := NewStore("http://localhost:8080")
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("/api/shorten", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+			return
+		}
+		var req ShortenRequest
+		json.NewDecoder(r.Body).Decode(&req)
+		if err := validateURL(req.URL); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		entry := store.Shorten(req.URL)
+		resp := ShortenResponse{
+			ShortURL:    "http://localhost:8080/r/" + entry.ShortCode,
+			ShortCode:   entry.ShortCode,
+			OriginalURL: entry.OriginalURL,
+		}
+		writeJSON(w, http.StatusCreated, resp)
+	})
+
+	tests := []struct {
+		name    string
+		payload string
+	}{
+		{"空のURL", `{"url":""}`},
+		{"無効なURL", `{"url":"not-a-url"}`},
+		{"ftpスキーム", `{"url":"ftp://example.com"}`},
+		{"ホスト名なし", `{"url":"http://"}`},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			body := bytes.NewBufferString(tc.payload)
+			req := httptest.NewRequest(http.MethodPost, "/api/shorten", body)
+			w := httptest.NewRecorder()
+			mux.ServeHTTP(w, req)
+
+			if w.Code != http.StatusBadRequest {
+				t.Errorf("expected status 400 for %s, got %d", tc.name, w.Code)
+			}
+		})
+	}
+}
+
+func TestValidateURL(t *testing.T) {
+	tests := []struct {
+		name    string
+		url     string
+		wantErr bool
+	}{
+		{"有効なhttps URL", "https://example.com", false},
+		{"有効なhttp URL", "http://example.com/path?q=1", false},
+		{"空文字列", "", true},
+		{"スキームなし", "example.com", true},
+		{"ftpスキーム", "ftp://example.com", true},
+		{"ホスト名なし", "http://", true},
+		{"無効な形式", "://invalid", true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateURL(tc.url)
+			if (err != nil) != tc.wantErr {
+				t.Errorf("validateURL(%q) error = %v, wantErr %v", tc.url, err, tc.wantErr)
+			}
+		})
+	}
+}
+
 func TestGetStats(t *testing.T) {
 	store := NewStore("http://localhost:8080")
 
@@ -116,5 +193,20 @@ func TestGetStats(t *testing.T) {
 	stats := store.GetStats()
 	if stats.TotalURLs != 2 {
 		t.Errorf("expected 2 total URLs, got %d", stats.TotalURLs)
+	}
+}
+
+func TestLoggingMiddleware(t *testing.T) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	logged := loggingMiddleware(handler)
+
+	req := httptest.NewRequest(http.MethodGet, "/health", nil)
+	w := httptest.NewRecorder()
+	logged.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected status 200, got %d", w.Code)
 	}
 }

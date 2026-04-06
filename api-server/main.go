@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"sync"
 	"time"
@@ -110,6 +111,46 @@ func writeJSON(w http.ResponseWriter, status int, data interface{}) {
 	json.NewEncoder(w).Encode(data)
 }
 
+// validateURL はURLが有効かつhttp/httpsスキームを持つかを検証する
+func validateURL(rawURL string) error {
+	if rawURL == "" {
+		return fmt.Errorf("URLは必須です")
+	}
+	parsed, err := url.ParseRequestURI(rawURL)
+	if err != nil {
+		return fmt.Errorf("URLの形式が無効です: %w", err)
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return fmt.Errorf("URLはhttpまたはhttpsスキームである必要があります")
+	}
+	if parsed.Host == "" {
+		return fmt.Errorf("URLにホスト名が必要です")
+	}
+	return nil
+}
+
+// loggingMiddleware はHTTPリクエストをログ出力するミドルウェア
+func loggingMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		wrapped := &responseWriter{ResponseWriter: w, statusCode: http.StatusOK}
+		next.ServeHTTP(wrapped, r)
+		duration := time.Since(start)
+		log.Printf("%s %s %d %s %s", r.Method, r.URL.Path, wrapped.statusCode, duration, r.RemoteAddr)
+	})
+}
+
+// responseWriter はステータスコードをキャプチャするためのラッパー
+type responseWriter struct {
+	http.ResponseWriter
+	statusCode int
+}
+
+func (rw *responseWriter) WriteHeader(code int) {
+	rw.statusCode = code
+	rw.ResponseWriter.WriteHeader(code)
+}
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" {
@@ -141,8 +182,8 @@ func main() {
 			return
 		}
 
-		if req.URL == "" {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "url is required"})
+		if err := validateURL(req.URL); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 			return
 		}
 
@@ -198,5 +239,5 @@ func main() {
 	})
 
 	log.Printf("URL Shortener API server starting on port %s", port)
-	log.Fatal(http.ListenAndServe(":"+port, mux))
+	log.Fatal(http.ListenAndServe(":"+port, loggingMiddleware(mux)))
 }
