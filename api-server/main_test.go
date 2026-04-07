@@ -3,9 +3,11 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 )
 
 func TestHealthCheck(t *testing.T) {
@@ -179,6 +181,186 @@ func TestValidateURL(t *testing.T) {
 			err := validateURL(tc.url)
 			if (err != nil) != tc.wantErr {
 				t.Errorf("validateURL(%q) error = %v, wantErr %v", tc.url, err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestValidateURLBlocksPrivateIPs(t *testing.T) {
+	tests := []struct {
+		name string
+		url  string
+	}{
+		{"ループバックIPv4", "http://127.0.0.1/secret"},
+		{"ループバックlocalhost", "http://127.0.0.1:8080/admin"},
+		{"プライベートIP 10.x", "http://10.0.0.1/internal"},
+		{"プライベートIP 192.168.x", "http://192.168.1.100/private"},
+		{"プライベートIP 172.16.x", "http://172.16.0.1/internal"},
+		{"リンクローカル", "http://169.254.169.254/metadata"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateURL(tc.url)
+			if err == nil {
+				t.Errorf("validateURL(%q) should have returned an error for private IP", tc.url)
+			}
+		})
+	}
+}
+
+func TestIsPrivateIP(t *testing.T) {
+	tests := []struct {
+		name      string
+		ipStr     string
+		isPrivate bool
+	}{
+		{"ループバック 127.0.0.1", "127.0.0.1", true},
+		{"プライベート 10.0.0.1", "10.0.0.1", true},
+		{"プライベート 192.168.0.1", "192.168.0.1", true},
+		{"プライベート 172.16.0.1", "172.16.0.1", true},
+		{"リンクローカル 169.254.1.1", "169.254.1.1", true},
+		{"パブリック 8.8.8.8", "8.8.8.8", false},
+		{"パブリック 1.1.1.1", "1.1.1.1", false},
+		{"IPv6ループバック ::1", "::1", true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ip := net.ParseIP(tc.ipStr)
+			if ip == nil {
+				t.Fatalf("invalid test IP: %s", tc.ipStr)
+			}
+			result := isPrivateIP(ip)
+			if result != tc.isPrivate {
+				t.Errorf("isPrivateIP(%s) = %v, want %v", tc.ipStr, result, tc.isPrivate)
+			}
+		})
+	}
+}
+
+func TestRateLimiter(t *testing.T) {
+	// 3リクエスト/秒のレート制限でテスト
+	rl := NewRateLimiter(3, time.Second)
+
+	ip := "192.0.2.1"
+
+	// 最初の3リクエストは許可されるべき
+	for i := 0; i < 3; i++ {
+		allowed, remaining, _ := rl.Allow(ip)
+		if !allowed {
+			t.Errorf("request %d should be allowed", i+1)
+		}
+		expectedRemaining := 3 - (i + 1)
+		if remaining != expectedRemaining {
+			t.Errorf("request %d: expected %d remaining, got %d", i+1, expectedRemaining, remaining)
+		}
+	}
+
+	// 4番目のリクエストは拒否されるべき
+	allowed, remaining, _ := rl.Allow(ip)
+	if allowed {
+		t.Error("4th request should be blocked")
+	}
+	if remaining != 0 {
+		t.Errorf("expected 0 remaining, got %d", remaining)
+	}
+}
+
+func TestRateLimiterWindowReset(t *testing.T) {
+	// 1リクエスト/10ミリ秒のレート制限でテスト
+	rl := NewRateLimiter(1, 10*time.Millisecond)
+
+	ip := "192.0.2.2"
+
+	// 最初のリクエストは許可
+	allowed, _, _ := rl.Allow(ip)
+	if !allowed {
+		t.Error("first request should be allowed")
+	}
+
+	// 2番目のリクエストは拒否
+	allowed, _, _ = rl.Allow(ip)
+	if allowed {
+		t.Error("second request should be blocked")
+	}
+
+	// ウィンドウが過ぎた後は再び許可
+	time.Sleep(15 * time.Millisecond)
+	allowed, _, _ = rl.Allow(ip)
+	if !allowed {
+		t.Error("request after window reset should be allowed")
+	}
+}
+
+func TestRateLimitMiddleware(t *testing.T) {
+	rl := NewRateLimiter(2, time.Minute)
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	limited := rateLimitMiddleware(rl, handler)
+
+	// 最初の2リクエストは通過
+	for i := 0; i < 2; i++ {
+		req := httptest.NewRequest(http.MethodGet, "/test", nil)
+		req.RemoteAddr = "192.0.2.3:1234"
+		w := httptest.NewRecorder()
+		limited.ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			t.Errorf("request %d: expected 200, got %d", i+1, w.Code)
+		}
+		if w.Header().Get("X-RateLimit-Limit") == "" {
+			t.Error("X-RateLimit-Limit header should be set")
+		}
+	}
+
+	// 3番目のリクエストは429を返す
+	req := httptest.NewRequest(http.MethodGet, "/test", nil)
+	req.RemoteAddr = "192.0.2.3:1234"
+	w := httptest.NewRecorder()
+	limited.ServeHTTP(w, req)
+	if w.Code != http.StatusTooManyRequests {
+		t.Errorf("expected 429, got %d", w.Code)
+	}
+}
+
+func TestGetClientIP(t *testing.T) {
+	tests := []struct {
+		name       string
+		remoteAddr string
+		headers    map[string]string
+		expectedIP string
+	}{
+		{
+			name:       "X-Forwarded-Forヘッダーから取得",
+			remoteAddr: "10.0.0.1:1234",
+			headers:    map[string]string{"X-Forwarded-For": "203.0.113.5, 10.0.0.1"},
+			expectedIP: "203.0.113.5",
+		},
+		{
+			name:       "X-Real-IPヘッダーから取得",
+			remoteAddr: "10.0.0.1:1234",
+			headers:    map[string]string{"X-Real-IP": "203.0.113.10"},
+			expectedIP: "203.0.113.10",
+		},
+		{
+			name:       "RemoteAddrから取得",
+			remoteAddr: "203.0.113.20:5678",
+			headers:    map[string]string{},
+			expectedIP: "203.0.113.20",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/test", nil)
+			req.RemoteAddr = tc.remoteAddr
+			for k, v := range tc.headers {
+				req.Header.Set(k, v)
+			}
+			ip := getClientIP(req)
+			if ip != tc.expectedIP {
+				t.Errorf("getClientIP() = %s, want %s", ip, tc.expectedIP)
 			}
 		})
 	}
