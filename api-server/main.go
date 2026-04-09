@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	"database/sql"
 	_ "embed"
@@ -8,9 +9,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
+	"strings"
+	"sync"
 	"time"
 )
 
@@ -123,7 +127,41 @@ func writeJSON(w http.ResponseWriter, status int, data interface{}) {
 	json.NewEncoder(w).Encode(data)
 }
 
-// validateURL はURLが有効かつhttp/httpsスキームを持つかを検証する
+// privateIPRanges はブロック対象のプライベートIPレンジ（SSRF対策）
+var privateIPRanges []*net.IPNet
+
+func init() {
+	privateRanges := []string{
+		"127.0.0.0/8",    // ループバック (IPv4)
+		"::1/128",        // ループバック (IPv6)
+		"10.0.0.0/8",     // プライベート (RFC1918)
+		"172.16.0.0/12",  // プライベート (RFC1918)
+		"192.168.0.0/16", // プライベート (RFC1918)
+		"169.254.0.0/16", // リンクローカル (IPv4)
+		"fe80::/10",      // リンクローカル (IPv6)
+		"fc00::/7",       // ユニークローカル (IPv6)
+		"0.0.0.0/8",      // "このネットワーク"
+		"100.64.0.0/10",  // 共有アドレス空間 (RFC6598)
+	}
+	for _, cidr := range privateRanges {
+		_, ipNet, err := net.ParseCIDR(cidr)
+		if err == nil {
+			privateIPRanges = append(privateIPRanges, ipNet)
+		}
+	}
+}
+
+// isPrivateIP は指定されたIPアドレスがプライベート/ローカルアドレスかどうかを返す
+func isPrivateIP(ip net.IP) bool {
+	for _, ipNet := range privateIPRanges {
+		if ipNet.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+// validateURL はURLが有効かつhttp/httpsスキームを持つかを検証し、SSRF攻撃を防ぐ
 func validateURL(rawURL string) error {
 	if rawURL == "" {
 		return fmt.Errorf("URLは必須です")
@@ -138,7 +176,153 @@ func validateURL(rawURL string) error {
 	if parsed.Host == "" {
 		return fmt.Errorf("URLにホスト名が必要です")
 	}
+
+	// ホスト名からポートを除去してIPアドレスを取得
+	hostname := parsed.Hostname()
+
+	// IPアドレスとして直接解析
+	ip := net.ParseIP(hostname)
+	if ip != nil {
+		if isPrivateIP(ip) {
+			return fmt.Errorf("プライベートIPアドレスやローカルアドレスへのURLは許可されていません")
+		}
+		return nil
+	}
+
+	// ホスト名をDNS解決してIPアドレスを確認（3秒タイムアウト付き）
+	// DNS解決に失敗した場合は許可（ネットワーク環境の制約を考慮）
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	resolver := &net.Resolver{}
+	ips, err := resolver.LookupHost(ctx, hostname)
+	if err == nil {
+		for _, resolvedIP := range ips {
+			ip := net.ParseIP(resolvedIP)
+			if ip != nil && isPrivateIP(ip) {
+				return fmt.Errorf("プライベートIPアドレスやローカルアドレスへのURLは許可されていません")
+			}
+		}
+	}
+
 	return nil
+}
+
+// RateLimiter はIPアドレスベースのレート制限を管理する
+type RateLimiter struct {
+	mu       sync.Mutex
+	clients  map[string]*clientState
+	limit    int
+	window   time.Duration
+}
+
+type clientState struct {
+	count    int
+	windowStart time.Time
+}
+
+// NewRateLimiter は新しいレート制限器を作成する
+// limit: ウィンドウ内の最大リクエスト数
+// window: ウィンドウの長さ
+func NewRateLimiter(limit int, window time.Duration) *RateLimiter {
+	rl := &RateLimiter{
+		clients: make(map[string]*clientState),
+		limit:   limit,
+		window:  window,
+	}
+	// 古いエントリを定期的にクリーンアップ
+	go rl.cleanup()
+	return rl
+}
+
+func (rl *RateLimiter) cleanup() {
+	ticker := time.NewTicker(5 * time.Minute)
+	for range ticker.C {
+		rl.mu.Lock()
+		now := time.Now()
+		for ip, state := range rl.clients {
+			if now.Sub(state.windowStart) > rl.window*2 {
+				delete(rl.clients, ip)
+			}
+		}
+		rl.mu.Unlock()
+	}
+}
+
+// Allow はリクエストが許可されるかどうかを確認し、残りリクエスト数とリセット時刻を返す
+func (rl *RateLimiter) Allow(ip string) (allowed bool, remaining int, resetAt time.Time) {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+
+	now := time.Now()
+	state, exists := rl.clients[ip]
+
+	if !exists || now.Sub(state.windowStart) > rl.window {
+		// 新しいウィンドウを開始
+		rl.clients[ip] = &clientState{
+			count:       1,
+			windowStart: now,
+		}
+		return true, rl.limit - 1, now.Add(rl.window)
+	}
+
+	state.count++
+	resetAt = state.windowStart.Add(rl.window)
+
+	if state.count > rl.limit {
+		return false, 0, resetAt
+	}
+
+	return true, rl.limit - state.count, resetAt
+}
+
+// getClientIP はリクエストからクライアントIPを取得する
+func getClientIP(r *http.Request) string {
+	// X-Forwarded-For ヘッダーを確認（プロキシ経由の場合）
+	forwarded := r.Header.Get("X-Forwarded-For")
+	if forwarded != "" {
+		// 最初のIPを使用（クライアントのオリジナルIP）
+		parts := strings.Split(forwarded, ",")
+		if len(parts) > 0 {
+			ip := strings.TrimSpace(parts[0])
+			if net.ParseIP(ip) != nil {
+				return ip
+			}
+		}
+	}
+
+	// X-Real-IP ヘッダーを確認
+	realIP := r.Header.Get("X-Real-IP")
+	if realIP != "" && net.ParseIP(realIP) != nil {
+		return realIP
+	}
+
+	// RemoteAddrから取得
+	ip, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return ip
+}
+
+// rateLimitMiddleware はレート制限を適用するミドルウェア
+func rateLimitMiddleware(rl *RateLimiter, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ip := getClientIP(r)
+		allowed, remaining, resetAt := rl.Allow(ip)
+
+		w.Header().Set("X-RateLimit-Limit", fmt.Sprintf("%d", rl.limit))
+		w.Header().Set("X-RateLimit-Remaining", fmt.Sprintf("%d", remaining))
+		w.Header().Set("X-RateLimit-Reset", fmt.Sprintf("%d", resetAt.Unix()))
+
+		if !allowed {
+			writeJSON(w, http.StatusTooManyRequests, map[string]string{
+				"error": "リクエスト数の上限に達しました。しばらく待ってから再試行してください。",
+			})
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	})
 }
 
 // loggingMiddleware はHTTPリクエストをログ出力するミドルウェア
@@ -180,6 +364,8 @@ func main() {
 	defer db.Close()
 
 	store := NewStore(baseURL, db)
+	// レート制限: 1分間に60リクエストまで
+	rateLimiter := NewRateLimiter(60, time.Minute)
 	mux := http.NewServeMux()
 
 	// Root - serve frontend
@@ -197,8 +383,8 @@ func main() {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
 
-	// Shorten URL
-	mux.HandleFunc("/api/shorten", func(w http.ResponseWriter, r *http.Request) {
+	// Shorten URL（レート制限適用）
+	shortenHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 			return
@@ -229,6 +415,7 @@ func main() {
 		}
 		writeJSON(w, http.StatusCreated, resp)
 	})
+	mux.Handle("/api/shorten", rateLimitMiddleware(rateLimiter, shortenHandler))
 
 	// Redirect
 	mux.HandleFunc("/r/", func(w http.ResponseWriter, r *http.Request) {
