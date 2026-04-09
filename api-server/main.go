@@ -62,17 +62,30 @@ func (s *Store) generateCode(rawURL string) string {
 }
 
 func (s *Store) Shorten(originalURL string) (*URLEntry, error) {
-	code := s.generateCode(originalURL)
-	entry := &URLEntry{}
-	err := s.db.QueryRow(
-		`INSERT INTO urls (short_code, original_url) VALUES ($1, $2)
-		 RETURNING short_code, original_url, created_at, clicks`,
-		code, originalURL,
-	).Scan(&entry.ShortCode, &entry.OriginalURL, &entry.CreatedAt, &entry.Clicks)
-	if err != nil {
-		return nil, err
+	const maxRetries = 5
+	for i := 0; i < maxRetries; i++ {
+		code := s.generateCode(originalURL)
+		entry := &URLEntry{}
+		err := s.db.QueryRow(
+			`INSERT INTO urls (short_code, original_url) VALUES ($1, $2)
+			 RETURNING short_code, original_url, created_at, clicks`,
+			code, originalURL,
+		).Scan(&entry.ShortCode, &entry.OriginalURL, &entry.CreatedAt, &entry.Clicks)
+		if err != nil {
+			// ユニーク制約違反（ショートコード衝突）の場合はリトライ
+			if strings.Contains(err.Error(), "duplicate key") ||
+				strings.Contains(err.Error(), "unique") {
+				log.Printf("ショートコード衝突 (試行 %d/%d): code=%s", i+1, maxRetries, code)
+				continue
+			}
+			return nil, err
+		}
+		if i > 0 {
+			log.Printf("ショートコード衝突回避成功: %d回目で生成 code=%s", i+1, code)
+		}
+		return entry, nil
 	}
-	return entry, nil
+	return nil, fmt.Errorf("ショートコード生成に%d回失敗しました（衝突が多すぎます）", maxRetries)
 }
 
 func (s *Store) Resolve(code string) (string, bool) {
