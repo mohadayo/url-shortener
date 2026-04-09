@@ -2,6 +2,8 @@
 
 A multi-language URL shortener service built with **Go**, **Python**, and **TypeScript**.
 
+![Screenshot](docs/screenshot.png)
+
 ## Architecture
 
 | Component | Language | Description |

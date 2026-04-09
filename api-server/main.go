@@ -2,6 +2,8 @@ package main
 
 import (
 	"crypto/sha256"
+	"database/sql"
+	_ "embed"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -9,9 +11,11 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"sync"
 	"time"
 )
+
+//go:embed static/index.html
+var indexHTML []byte
 
 type URLEntry struct {
 	OriginalURL string    `json:"original_url"`
@@ -37,69 +41,77 @@ type StatsResponse struct {
 }
 
 type Store struct {
-	mu      sync.RWMutex
-	urls    map[string]*URLEntry
+	db      *sql.DB
 	baseURL string
 }
 
-func NewStore(baseURL string) *Store {
+func NewStore(baseURL string, db *sql.DB) *Store {
 	return &Store{
-		urls:    make(map[string]*URLEntry),
+		db:      db,
 		baseURL: baseURL,
 	}
 }
 
-func (s *Store) generateCode(url string) string {
-	hash := sha256.Sum256([]byte(url + time.Now().String()))
+func (s *Store) generateCode(rawURL string) string {
+	hash := sha256.Sum256([]byte(rawURL + time.Now().String()))
 	return hex.EncodeToString(hash[:])[:8]
 }
 
-func (s *Store) Shorten(originalURL string) *URLEntry {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
+func (s *Store) Shorten(originalURL string) (*URLEntry, error) {
 	code := s.generateCode(originalURL)
-	entry := &URLEntry{
-		OriginalURL: originalURL,
-		ShortCode:   code,
-		CreatedAt:   time.Now(),
-		Clicks:      0,
+	entry := &URLEntry{}
+	err := s.db.QueryRow(
+		`INSERT INTO urls (short_code, original_url) VALUES ($1, $2)
+		 RETURNING short_code, original_url, created_at, clicks`,
+		code, originalURL,
+	).Scan(&entry.ShortCode, &entry.OriginalURL, &entry.CreatedAt, &entry.Clicks)
+	if err != nil {
+		return nil, err
 	}
-	s.urls[code] = entry
-	return entry
+	return entry, nil
 }
 
 func (s *Store) Resolve(code string) (string, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	entry, ok := s.urls[code]
-	if !ok {
+	var originalURL string
+	err := s.db.QueryRow(
+		`UPDATE urls SET clicks = clicks + 1 WHERE short_code = $1 RETURNING original_url`,
+		code,
+	).Scan(&originalURL)
+	if err != nil {
 		return "", false
 	}
-	entry.Clicks++
-	return entry.OriginalURL, true
+	return originalURL, true
 }
 
 func (s *Store) GetStats() StatsResponse {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	stats := StatsResponse{Entries: []URLEntry{}}
+	rows, err := s.db.Query(
+		`SELECT short_code, original_url, created_at, clicks FROM urls ORDER BY created_at DESC`,
+	)
+	if err != nil {
+		return stats
+	}
+	defer rows.Close()
 
-	stats := StatsResponse{}
-	for _, entry := range s.urls {
+	for rows.Next() {
+		var entry URLEntry
+		if err := rows.Scan(&entry.ShortCode, &entry.OriginalURL, &entry.CreatedAt, &entry.Clicks); err != nil {
+			continue
+		}
 		stats.TotalURLs++
 		stats.TotalClicks += entry.Clicks
-		stats.Entries = append(stats.Entries, *entry)
+		stats.Entries = append(stats.Entries, entry)
 	}
 	return stats
 }
 
 func (s *Store) GetEntry(code string) (*URLEntry, bool) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	entry, ok := s.urls[code]
-	if !ok {
+	entry := &URLEntry{}
+	err := s.db.QueryRow(
+		`SELECT short_code, original_url, created_at, clicks FROM urls WHERE short_code = $1`,
+		code,
+	).Scan(&entry.ShortCode, &entry.OriginalURL, &entry.CreatedAt, &entry.Clicks)
+	if err != nil {
 		return nil, false
 	}
 	return entry, true
@@ -161,8 +173,24 @@ func main() {
 		baseURL = fmt.Sprintf("http://localhost:%s", port)
 	}
 
-	store := NewStore(baseURL)
+	db, err := initDB()
+	if err != nil {
+		log.Fatalf("Failed to initialize database: %v", err)
+	}
+	defer db.Close()
+
+	store := NewStore(baseURL, db)
 	mux := http.NewServeMux()
+
+	// Root - serve frontend
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Write(indexHTML)
+	})
 
 	// Health check
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
@@ -187,7 +215,13 @@ func main() {
 			return
 		}
 
-		entry := store.Shorten(req.URL)
+		entry, err := store.Shorten(req.URL)
+		if err != nil {
+			log.Printf("Failed to shorten URL: %v", err)
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to shorten URL"})
+			return
+		}
+
 		resp := ShortenResponse{
 			ShortURL:    fmt.Sprintf("%s/r/%s", baseURL, entry.ShortCode),
 			ShortCode:   entry.ShortCode,

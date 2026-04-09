@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>URL Shortener</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-50 min-h-screen">
+  <div class="max-w-2xl mx-auto px-4 py-16">
+    <div class="text-center mb-10">
+      <h1 class="text-3xl font-bold text-gray-900">URL Shortener</h1>
+      <p class="text-gray-500 mt-2">Enter a long URL and get a short one</p>
+    </div>
+
+    <div class="bg-white rounded-xl shadow-sm border border-gray-200 p-6">
+      <form id="shorten-form" class="flex gap-3">
+        <input
+          type="url"
+          id="url-input"
+          placeholder="https://example.com/very/long/url..."
+          required
+          class="flex-1 border border-gray-300 rounded-lg px-4 py-3 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+        />
+        <button
+          type="submit"
+          id="submit-btn"
+          class="bg-blue-600 text-white px-6 py-3 rounded-lg text-sm font-medium hover:bg-blue-700 transition-colors whitespace-nowrap disabled:opacity-50"
+        >
+          Shorten
+        </button>
+      </form>
+
+      <div id="result" class="hidden mt-4 p-4 bg-blue-50 rounded-lg">
+        <p class="text-xs text-gray-500 mb-1">Shortened URL</p>
+        <div class="flex items-center gap-3">
+          <a id="short-url" href="#" target="_blank" class="text-blue-600 font-medium text-lg hover:underline break-all"></a>
+          <button
+            id="copy-btn"
+            class="shrink-0 bg-white border border-gray-300 text-gray-700 px-3 py-1.5 rounded-md text-xs hover:bg-gray-50 transition-colors"
+          >
+            Copy
+          </button>
+        </div>
+      </div>
+
+      <div id="error" class="hidden mt-4 p-4 bg-red-50 text-red-700 text-sm rounded-lg"></div>
+    </div>
+
+    <div class="mt-8">
+      <div class="flex items-center justify-between mb-4">
+        <h2 class="text-lg font-semibold text-gray-900">Recent URLs</h2>
+        <button
+          id="refresh-btn"
+          class="text-sm text-gray-500 hover:text-gray-700 transition-colors"
+        >
+          Refresh
+        </button>
+      </div>
+      <div id="stats-list" class="space-y-2"></div>
+      <p id="stats-empty" class="text-sm text-gray-400 text-center py-6">No URLs shortened yet</p>
+    </div>
+  </div>
+
+  <script>
+    const API = window.location.origin;
+    const form = document.getElementById('shorten-form');
+    const input = document.getElementById('url-input');
+    const submitBtn = document.getElementById('submit-btn');
+    const resultDiv = document.getElementById('result');
+    const errorDiv = document.getElementById('error');
+    const shortUrlEl = document.getElementById('short-url');
+    const copyBtn = document.getElementById('copy-btn');
+    const statsList = document.getElementById('stats-list');
+    const statsEmpty = document.getElementById('stats-empty');
+
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      resultDiv.classList.add('hidden');
+      errorDiv.classList.add('hidden');
+      submitBtn.disabled = true;
+      submitBtn.textContent = '...';
+
+      try {
+        const res = await fetch(`${API}/api/shorten`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ url: input.value }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Failed');
+
+        shortUrlEl.href = data.short_url;
+        shortUrlEl.textContent = data.short_url;
+        resultDiv.classList.remove('hidden');
+        input.value = '';
+        loadStats();
+      } catch (err) {
+        errorDiv.textContent = err.message;
+        errorDiv.classList.remove('hidden');
+      } finally {
+        submitBtn.disabled = false;
+        submitBtn.textContent = 'Shorten';
+      }
+    });
+
+    copyBtn.addEventListener('click', () => {
+      navigator.clipboard.writeText(shortUrlEl.href);
+      copyBtn.textContent = 'Copied!';
+      setTimeout(() => copyBtn.textContent = 'Copy', 1500);
+    });
+
+    async function loadStats() {
+      try {
+        const res = await fetch(`${API}/api/stats`);
+        const data = await res.json();
+        if (!data.entries || data.entries.length === 0) {
+          statsList.innerHTML = '';
+          statsEmpty.classList.remove('hidden');
+          return;
+        }
+        statsEmpty.classList.add('hidden');
+        statsList.innerHTML = data.entries.slice(0, 10).map(e => `
+          <div class="bg-white rounded-lg border border-gray-200 p-3 flex items-center justify-between gap-4">
+            <div class="min-w-0 flex-1">
+              <a href="${API}/r/${e.short_code}" target="_blank" class="text-blue-600 text-sm font-medium hover:underline">${API}/r/${e.short_code}</a>
+              <p class="text-xs text-gray-400 truncate mt-0.5">${e.original_url}</p>
+            </div>
+            <span class="text-xs text-gray-500 shrink-0">${e.clicks} clicks</span>
+          </div>
+        `).join('');
+      } catch {}
+    }
+
+    document.getElementById('refresh-btn').addEventListener('click', loadStats);
+    loadStats();
+  </script>
+</body>
+</html>

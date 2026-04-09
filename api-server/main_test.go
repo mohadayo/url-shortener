@@ -2,14 +2,49 @@ package main
 
 import (
 	"bytes"
+	"database/sql"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"testing"
+
+	_ "github.com/lib/pq"
 )
 
+func setupTestDB(t *testing.T) *sql.DB {
+	t.Helper()
+	dsn := os.Getenv("DATABASE_URL")
+	if dsn == "" {
+		t.Skip("DATABASE_URL not set, skipping database test")
+	}
+	db, err := sql.Open("postgres", dsn)
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+	if err := db.Ping(); err != nil {
+		t.Skipf("database not reachable: %v", err)
+	}
+	db.Exec(`DROP TABLE IF EXISTS urls`)
+	_, err = db.Exec(`
+		CREATE TABLE urls (
+			short_code VARCHAR(8) PRIMARY KEY,
+			original_url TEXT NOT NULL,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			clicks INTEGER NOT NULL DEFAULT 0
+		)
+	`)
+	if err != nil {
+		t.Fatalf("failed to create table: %v", err)
+	}
+	t.Cleanup(func() {
+		db.Exec(`DROP TABLE IF EXISTS urls`)
+		db.Close()
+	})
+	return db
+}
+
 func TestHealthCheck(t *testing.T) {
-	store := NewStore("http://localhost:8080")
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
@@ -28,13 +63,16 @@ func TestHealthCheck(t *testing.T) {
 	if resp["status"] != "ok" {
 		t.Errorf("expected status ok, got %s", resp["status"])
 	}
-	_ = store
 }
 
 func TestShortenAndResolve(t *testing.T) {
-	store := NewStore("http://localhost:8080")
+	db := setupTestDB(t)
+	store := NewStore("http://localhost:8080", db)
 
-	entry := store.Shorten("https://example.com")
+	entry, err := store.Shorten("https://example.com")
+	if err != nil {
+		t.Fatalf("failed to shorten: %v", err)
+	}
 	if entry.ShortCode == "" {
 		t.Fatal("expected non-empty short code")
 	}
@@ -60,7 +98,8 @@ func TestShortenAndResolve(t *testing.T) {
 }
 
 func TestResolveNotFound(t *testing.T) {
-	store := NewStore("http://localhost:8080")
+	db := setupTestDB(t)
+	store := NewStore("http://localhost:8080", db)
 
 	_, ok := store.Resolve("nonexistent")
 	if ok {
@@ -69,7 +108,8 @@ func TestResolveNotFound(t *testing.T) {
 }
 
 func TestShortenAPI(t *testing.T) {
-	store := NewStore("http://localhost:8080")
+	db := setupTestDB(t)
+	store := NewStore("http://localhost:8080", db)
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/api/shorten", func(w http.ResponseWriter, r *http.Request) {
@@ -83,7 +123,11 @@ func TestShortenAPI(t *testing.T) {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 			return
 		}
-		entry := store.Shorten(req.URL)
+		entry, err := store.Shorten(req.URL)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to shorten URL"})
+			return
+		}
 		resp := ShortenResponse{
 			ShortURL:    "http://localhost:8080/r/" + entry.ShortCode,
 			ShortCode:   entry.ShortCode,
@@ -112,7 +156,6 @@ func TestShortenAPI(t *testing.T) {
 }
 
 func TestShortenAPIInvalidURL(t *testing.T) {
-	store := NewStore("http://localhost:8080")
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/api/shorten", func(w http.ResponseWriter, r *http.Request) {
@@ -126,13 +169,7 @@ func TestShortenAPIInvalidURL(t *testing.T) {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 			return
 		}
-		entry := store.Shorten(req.URL)
-		resp := ShortenResponse{
-			ShortURL:    "http://localhost:8080/r/" + entry.ShortCode,
-			ShortCode:   entry.ShortCode,
-			OriginalURL: entry.OriginalURL,
-		}
-		writeJSON(w, http.StatusCreated, resp)
+		writeJSON(w, http.StatusCreated, map[string]string{})
 	})
 
 	tests := []struct {
@@ -185,7 +222,8 @@ func TestValidateURL(t *testing.T) {
 }
 
 func TestGetStats(t *testing.T) {
-	store := NewStore("http://localhost:8080")
+	db := setupTestDB(t)
+	store := NewStore("http://localhost:8080", db)
 
 	store.Shorten("https://example.com")
 	store.Shorten("https://example.org")

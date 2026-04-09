@@ -1,11 +1,31 @@
 services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: url_shortener
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U user"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
   api-server:
     build: ./api-server
     ports:
       - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
     environment:
       - PORT=8080
       - BASE_URL=http://localhost:8080
+      - DATABASE_URL=postgres://user:password@postgres:5432/url_shortener?sslmode=disable
     healthcheck:
       test: ["CMD", "wget", "--quiet", "--spider", "http://localhost:8080/health"]
       interval: 10s
@@ -28,3 +48,6 @@ services:
       api-server:
         condition: service_healthy
     command: ["stats", "--api-url", "http://api-server:8080"]
+
+volumes:
+  pgdata:
