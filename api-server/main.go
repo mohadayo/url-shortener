@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -100,10 +101,15 @@ func (s *Store) Resolve(code string) (string, bool) {
 	return originalURL, true
 }
 
-func (s *Store) GetStats() StatsResponse {
+func (s *Store) GetStats(limit, offset int) StatsResponse {
 	stats := StatsResponse{Entries: []URLEntry{}}
+
+	// Get total count first
+	s.db.QueryRow(`SELECT COUNT(*), COALESCE(SUM(clicks), 0) FROM urls`).Scan(&stats.TotalURLs, &stats.TotalClicks)
+
 	rows, err := s.db.Query(
-		`SELECT short_code, original_url, created_at, clicks FROM urls ORDER BY created_at DESC`,
+		`SELECT short_code, original_url, created_at, clicks FROM urls ORDER BY created_at DESC LIMIT $1 OFFSET $2`,
+		limit, offset,
 	)
 	if err != nil {
 		return stats
@@ -115,8 +121,6 @@ func (s *Store) GetStats() StatsResponse {
 		if err := rows.Scan(&entry.ShortCode, &entry.OriginalURL, &entry.CreatedAt, &entry.Clicks); err != nil {
 			continue
 		}
-		stats.TotalURLs++
-		stats.TotalClicks += entry.Clicks
 		stats.Entries = append(stats.Entries, entry)
 	}
 	return stats
@@ -453,7 +457,19 @@ func main() {
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 			return
 		}
-		stats := store.GetStats()
+		limit := 20
+		offset := 0
+		if v := r.URL.Query().Get("limit"); v != "" {
+			if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 100 {
+				limit = n
+			}
+		}
+		if v := r.URL.Query().Get("offset"); v != "" {
+			if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+				offset = n
+			}
+		}
+		stats := store.GetStats(limit, offset)
 		writeJSON(w, http.StatusOK, stats)
 	})
 
