@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strconv"
 	"testing"
 	"time"
 
@@ -410,9 +411,199 @@ func TestGetStats(t *testing.T) {
 	store.Shorten("https://example.com")
 	store.Shorten("https://example.org")
 
-	stats := store.GetStats()
+	stats := store.GetStats(20, 0)
 	if stats.TotalURLs != 2 {
 		t.Errorf("expected 2 total URLs, got %d", stats.TotalURLs)
+	}
+}
+
+func TestGetStatsPagination(t *testing.T) {
+	db := setupTestDB(t)
+	store := NewStore("http://localhost:8080", db)
+
+	// 5件のURLを登録
+	for i := 0; i < 5; i++ {
+		_, err := store.Shorten("https://example.com/" + strconv.Itoa(i))
+		if err != nil {
+			t.Fatalf("failed to shorten URL %d: %v", i, err)
+		}
+	}
+
+	// limit=2で最初のページを取得
+	stats := store.GetStats(2, 0)
+	if stats.TotalURLs != 5 {
+		t.Errorf("expected TotalURLs=5, got %d", stats.TotalURLs)
+	}
+	if len(stats.Entries) != 2 {
+		t.Errorf("expected 2 entries, got %d", len(stats.Entries))
+	}
+
+	// offset=2で次のページを取得
+	stats2 := store.GetStats(2, 2)
+	if stats2.TotalURLs != 5 {
+		t.Errorf("expected TotalURLs=5, got %d", stats2.TotalURLs)
+	}
+	if len(stats2.Entries) != 2 {
+		t.Errorf("expected 2 entries, got %d", len(stats2.Entries))
+	}
+
+	// 最初のページと2ページ目のエントリが異なることを確認
+	if len(stats.Entries) > 0 && len(stats2.Entries) > 0 {
+		if stats.Entries[0].ShortCode == stats2.Entries[0].ShortCode {
+			t.Error("expected different entries on different pages")
+		}
+	}
+
+	// offset=4で最後のページを取得（残り1件）
+	stats3 := store.GetStats(2, 4)
+	if len(stats3.Entries) != 1 {
+		t.Errorf("expected 1 entry on last page, got %d", len(stats3.Entries))
+	}
+
+	// offset=10で範囲外を取得（0件）
+	stats4 := store.GetStats(2, 10)
+	if len(stats4.Entries) != 0 {
+		t.Errorf("expected 0 entries for out-of-range offset, got %d", len(stats4.Entries))
+	}
+	if stats4.TotalURLs != 5 {
+		t.Errorf("expected TotalURLs=5 even with out-of-range offset, got %d", stats4.TotalURLs)
+	}
+}
+
+func TestGetStatsTotalClicksWithPagination(t *testing.T) {
+	db := setupTestDB(t)
+	store := NewStore("http://localhost:8080", db)
+
+	// 3件のURLを登録
+	entries := make([]*URLEntry, 3)
+	for i := 0; i < 3; i++ {
+		entry, err := store.Shorten("https://example.com/clicks/" + strconv.Itoa(i))
+		if err != nil {
+			t.Fatalf("failed to shorten URL %d: %v", i, err)
+		}
+		entries[i] = entry
+	}
+
+	// 各URLをクリック
+	store.Resolve(entries[0].ShortCode) // 1クリック
+	store.Resolve(entries[1].ShortCode) // 1クリック
+	store.Resolve(entries[1].ShortCode) // 2クリック目
+
+	// ページネーションで1件だけ取得しても、TotalClicksは全体の合計
+	stats := store.GetStats(1, 0)
+	if stats.TotalClicks != 3 {
+		t.Errorf("expected TotalClicks=3, got %d", stats.TotalClicks)
+	}
+	if stats.TotalURLs != 3 {
+		t.Errorf("expected TotalURLs=3, got %d", stats.TotalURLs)
+	}
+	if len(stats.Entries) != 1 {
+		t.Errorf("expected 1 entry, got %d", len(stats.Entries))
+	}
+}
+
+func TestStatsAPIPagination(t *testing.T) {
+	db := setupTestDB(t)
+	store := NewStore("http://localhost:8080", db)
+
+	// 3件のURLを登録
+	for i := 0; i < 3; i++ {
+		store.Shorten("https://example.com/api/" + strconv.Itoa(i))
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/stats", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+			return
+		}
+		limit := 20
+		offset := 0
+		if v := r.URL.Query().Get("limit"); v != "" {
+			if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 100 {
+				limit = n
+			}
+		}
+		if v := r.URL.Query().Get("offset"); v != "" {
+			if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+				offset = n
+			}
+		}
+		stats := store.GetStats(limit, offset)
+		writeJSON(w, http.StatusOK, stats)
+	})
+
+	// デフォルトのlimit/offsetで取得
+	req := httptest.NewRequest(http.MethodGet, "/api/stats", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Errorf("expected status 200, got %d", w.Code)
+	}
+	var stats StatsResponse
+	json.NewDecoder(w.Body).Decode(&stats)
+	if stats.TotalURLs != 3 {
+		t.Errorf("expected TotalURLs=3, got %d", stats.TotalURLs)
+	}
+	if len(stats.Entries) != 3 {
+		t.Errorf("expected 3 entries, got %d", len(stats.Entries))
+	}
+
+	// limit=1で取得
+	req = httptest.NewRequest(http.MethodGet, "/api/stats?limit=1&offset=0", nil)
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	var stats2 StatsResponse
+	json.NewDecoder(w.Body).Decode(&stats2)
+	if len(stats2.Entries) != 1 {
+		t.Errorf("expected 1 entry with limit=1, got %d", len(stats2.Entries))
+	}
+	if stats2.TotalURLs != 3 {
+		t.Errorf("expected TotalURLs=3, got %d", stats2.TotalURLs)
+	}
+
+	// 無効なlimitパラメータ（デフォルトの20が使用される）
+	req = httptest.NewRequest(http.MethodGet, "/api/stats?limit=invalid", nil)
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	var stats3 StatsResponse
+	json.NewDecoder(w.Body).Decode(&stats3)
+	if len(stats3.Entries) != 3 {
+		t.Errorf("expected 3 entries with invalid limit, got %d", len(stats3.Entries))
+	}
+
+	// limitが上限を超える場合（デフォルトの20が使用される）
+	req = httptest.NewRequest(http.MethodGet, "/api/stats?limit=200", nil)
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	var stats4 StatsResponse
+	json.NewDecoder(w.Body).Decode(&stats4)
+	if len(stats4.Entries) != 3 {
+		t.Errorf("expected 3 entries with limit=200 (falls back to default), got %d", len(stats4.Entries))
+	}
+}
+
+func TestDBConnectionPoolSettings(t *testing.T) {
+	db := setupTestDB(t)
+
+	// 接続プール設定を適用
+	db.SetMaxOpenConns(25)
+	db.SetMaxIdleConns(5)
+	db.SetConnMaxLifetime(5 * time.Minute)
+
+	// 設定が適用されていることを確認
+	if db.Stats().MaxOpenConnections != 25 {
+		t.Errorf("expected MaxOpenConnections=25, got %d", db.Stats().MaxOpenConnections)
+	}
+
+	// 接続が正常に動作することを確認
+	var result int
+	err := db.QueryRow("SELECT 1").Scan(&result)
+	if err != nil {
+		t.Fatalf("query failed after pool settings: %v", err)
+	}
+	if result != 1 {
+		t.Errorf("expected 1, got %d", result)
 	}
 }
 
