@@ -104,14 +104,19 @@ func (s *Store) Resolve(code string) (string, bool) {
 func (s *Store) GetStats(limit, offset int) StatsResponse {
 	stats := StatsResponse{Entries: []URLEntry{}}
 
-	// Get total count first
-	s.db.QueryRow(`SELECT COUNT(*), COALESCE(SUM(clicks), 0) FROM urls`).Scan(&stats.TotalURLs, &stats.TotalClicks)
+	if err := s.db.QueryRow(
+		`SELECT COUNT(*), COALESCE(SUM(clicks), 0) FROM urls`,
+	).Scan(&stats.TotalURLs, &stats.TotalClicks); err != nil {
+		log.Printf("統計集計クエリ失敗: %v", err)
+		return stats
+	}
 
 	rows, err := s.db.Query(
 		`SELECT short_code, original_url, created_at, clicks FROM urls ORDER BY created_at DESC LIMIT $1 OFFSET $2`,
 		limit, offset,
 	)
 	if err != nil {
+		log.Printf("統計一覧クエリ失敗: %v", err)
 		return stats
 	}
 	defer rows.Close()
@@ -119,9 +124,13 @@ func (s *Store) GetStats(limit, offset int) StatsResponse {
 	for rows.Next() {
 		var entry URLEntry
 		if err := rows.Scan(&entry.ShortCode, &entry.OriginalURL, &entry.CreatedAt, &entry.Clicks); err != nil {
+			log.Printf("統計行スキャン失敗: %v", err)
 			continue
 		}
 		stats.Entries = append(stats.Entries, entry)
+	}
+	if err := rows.Err(); err != nil {
+		log.Printf("統計行イテレーションエラー: %v", err)
 	}
 	return stats
 }
