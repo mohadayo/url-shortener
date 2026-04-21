@@ -7,20 +7,25 @@ import (
 	_ "embed"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
 //go:embed static/index.html
 var indexHTML []byte
+
+const maxURLLength = 2048
 
 type URLEntry struct {
 	OriginalURL string    `json:"original_url"`
@@ -191,6 +196,9 @@ func isPrivateIP(ip net.IP) bool {
 func validateURL(rawURL string) error {
 	if rawURL == "" {
 		return fmt.Errorf("URLは必須です")
+	}
+	if len(rawURL) > maxURLLength {
+		return fmt.Errorf("URLは%d文字以内である必要があります", maxURLLength)
 	}
 	parsed, err := url.ParseRequestURI(rawURL)
 	if err != nil {
@@ -406,7 +414,17 @@ func main() {
 
 	// Health check
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+		ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+		defer cancel()
+		dbStatus := "ok"
+		if err := db.PingContext(ctx); err != nil {
+			dbStatus = "error"
+		}
+		status := "ok"
+		if dbStatus != "ok" {
+			status = "degraded"
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"status": status, "db": dbStatus})
 	})
 
 	// Shorten URL（レート制限適用）
@@ -497,6 +515,32 @@ func main() {
 		writeJSON(w, http.StatusOK, entry)
 	})
 
-	log.Printf("URL Shortener API server starting on port %s", port)
-	log.Fatal(http.ListenAndServe(":"+port, loggingMiddleware(mux)))
+	srv := &http.Server{
+		Addr:         ":" + port,
+		Handler:      loggingMiddleware(mux),
+		ReadTimeout:  10 * time.Second,
+		WriteTimeout: 30 * time.Second,
+		IdleTimeout:  60 * time.Second,
+	}
+
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+
+	go func() {
+		log.Printf("URL Shortener API server starting on port %s", port)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Fatalf("Failed to start server: %v", err)
+		}
+	}()
+
+	<-quit
+	log.Println("Shutting down server...")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	if err := srv.Shutdown(ctx); err != nil {
+		log.Fatalf("Server forced to shutdown: %v", err)
+	}
+	log.Println("Server stopped gracefully")
 }
