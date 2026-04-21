@@ -7,20 +7,25 @@ import (
 	_ "embed"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
 //go:embed static/index.html
 var indexHTML []byte
+
+const maxURLLength = 2048
 
 type URLEntry struct {
 	OriginalURL string    `json:"original_url"`
@@ -73,7 +78,6 @@ func (s *Store) Shorten(originalURL string) (*URLEntry, error) {
 			code, originalURL,
 		).Scan(&entry.ShortCode, &entry.OriginalURL, &entry.CreatedAt, &entry.Clicks)
 		if err != nil {
-			// ユニーク制約違反（ショートコード衝突）の場合はリトライ
 			if strings.Contains(err.Error(), "duplicate key") ||
 				strings.Contains(err.Error(), "unique") {
 				log.Printf("ショートコード衝突 (試行 %d/%d): code=%s", i+1, maxRetries, code)
@@ -104,7 +108,6 @@ func (s *Store) Resolve(code string) (string, bool) {
 func (s *Store) GetStats(limit, offset int) StatsResponse {
 	stats := StatsResponse{Entries: []URLEntry{}}
 
-	// Get total count first
 	s.db.QueryRow(`SELECT COUNT(*), COALESCE(SUM(clicks), 0) FROM urls`).Scan(&stats.TotalURLs, &stats.TotalClicks)
 
 	rows, err := s.db.Query(
@@ -144,21 +147,20 @@ func writeJSON(w http.ResponseWriter, status int, data interface{}) {
 	json.NewEncoder(w).Encode(data)
 }
 
-// privateIPRanges はブロック対象のプライベートIPレンジ（SSRF対策）
 var privateIPRanges []*net.IPNet
 
 func init() {
 	privateRanges := []string{
-		"127.0.0.0/8",    // ループバック (IPv4)
-		"::1/128",        // ループバック (IPv6)
-		"10.0.0.0/8",     // プライベート (RFC1918)
-		"172.16.0.0/12",  // プライベート (RFC1918)
-		"192.168.0.0/16", // プライベート (RFC1918)
-		"169.254.0.0/16", // リンクローカル (IPv4)
-		"fe80::/10",      // リンクローカル (IPv6)
-		"fc00::/7",       // ユニークローカル (IPv6)
-		"0.0.0.0/8",      // "このネットワーク"
-		"100.64.0.0/10",  // 共有アドレス空間 (RFC6598)
+		"127.0.0.0/8",
+		"::1/128",
+		"10.0.0.0/8",
+		"172.16.0.0/12",
+		"192.168.0.0/16",
+		"169.254.0.0/16",
+		"fe80::/10",
+		"fc00::/7",
+		"0.0.0.0/8",
+		"100.64.0.0/10",
 	}
 	for _, cidr := range privateRanges {
 		_, ipNet, err := net.ParseCIDR(cidr)
@@ -168,7 +170,6 @@ func init() {
 	}
 }
 
-// isPrivateIP は指定されたIPアドレスがプライベート/ローカルアドレスかどうかを返す
 func isPrivateIP(ip net.IP) bool {
 	for _, ipNet := range privateIPRanges {
 		if ipNet.Contains(ip) {
@@ -178,10 +179,12 @@ func isPrivateIP(ip net.IP) bool {
 	return false
 }
 
-// validateURL はURLが有効かつhttp/httpsスキームを持つかを検証し、SSRF攻撃を防ぐ
 func validateURL(rawURL string) error {
 	if rawURL == "" {
 		return fmt.Errorf("URLは必須です")
+	}
+	if len(rawURL) > maxURLLength {
+		return fmt.Errorf("URLは%d文字以内である必要があります", maxURLLength)
 	}
 	parsed, err := url.ParseRequestURI(rawURL)
 	if err != nil {
@@ -194,10 +197,8 @@ func validateURL(rawURL string) error {
 		return fmt.Errorf("URLにホスト名が必要です")
 	}
 
-	// ホスト名からポートを除去してIPアドレスを取得
 	hostname := parsed.Hostname()
 
-	// IPアドレスとして直接解析
 	ip := net.ParseIP(hostname)
 	if ip != nil {
 		if isPrivateIP(ip) {
@@ -206,8 +207,6 @@ func validateURL(rawURL string) error {
 		return nil
 	}
 
-	// ホスト名をDNS解決してIPアドレスを確認（3秒タイムアウト付き）
-	// DNS解決に失敗した場合は許可（ネットワーク環境の制約を考慮）
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	resolver := &net.Resolver{}
@@ -224,29 +223,24 @@ func validateURL(rawURL string) error {
 	return nil
 }
 
-// RateLimiter はIPアドレスベースのレート制限を管理する
 type RateLimiter struct {
-	mu       sync.Mutex
-	clients  map[string]*clientState
-	limit    int
-	window   time.Duration
+	mu      sync.Mutex
+	clients map[string]*clientState
+	limit   int
+	window  time.Duration
 }
 
 type clientState struct {
-	count    int
+	count       int
 	windowStart time.Time
 }
 
-// NewRateLimiter は新しいレート制限器を作成する
-// limit: ウィンドウ内の最大リクエスト数
-// window: ウィンドウの長さ
 func NewRateLimiter(limit int, window time.Duration) *RateLimiter {
 	rl := &RateLimiter{
 		clients: make(map[string]*clientState),
 		limit:   limit,
 		window:  window,
 	}
-	// 古いエントリを定期的にクリーンアップ
 	go rl.cleanup()
 	return rl
 }
@@ -265,7 +259,6 @@ func (rl *RateLimiter) cleanup() {
 	}
 }
 
-// Allow はリクエストが許可されるかどうかを確認し、残りリクエスト数とリセット時刻を返す
 func (rl *RateLimiter) Allow(ip string) (allowed bool, remaining int, resetAt time.Time) {
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
@@ -274,7 +267,6 @@ func (rl *RateLimiter) Allow(ip string) (allowed bool, remaining int, resetAt ti
 	state, exists := rl.clients[ip]
 
 	if !exists || now.Sub(state.windowStart) > rl.window {
-		// 新しいウィンドウを開始
 		rl.clients[ip] = &clientState{
 			count:       1,
 			windowStart: now,
@@ -292,12 +284,9 @@ func (rl *RateLimiter) Allow(ip string) (allowed bool, remaining int, resetAt ti
 	return true, rl.limit - state.count, resetAt
 }
 
-// getClientIP はリクエストからクライアントIPを取得する
 func getClientIP(r *http.Request) string {
-	// X-Forwarded-For ヘッダーを確認（プロキシ経由の場合）
 	forwarded := r.Header.Get("X-Forwarded-For")
 	if forwarded != "" {
-		// 最初のIPを使用（クライアントのオリジナルIP）
 		parts := strings.Split(forwarded, ",")
 		if len(parts) > 0 {
 			ip := strings.TrimSpace(parts[0])
@@ -307,13 +296,11 @@ func getClientIP(r *http.Request) string {
 		}
 	}
 
-	// X-Real-IP ヘッダーを確認
 	realIP := r.Header.Get("X-Real-IP")
 	if realIP != "" && net.ParseIP(realIP) != nil {
 		return realIP
 	}
 
-	// RemoteAddrから取得
 	ip, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		return r.RemoteAddr
@@ -321,7 +308,6 @@ func getClientIP(r *http.Request) string {
 	return ip
 }
 
-// rateLimitMiddleware はレート制限を適用するミドルウェア
 func rateLimitMiddleware(rl *RateLimiter, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ip := getClientIP(r)
@@ -342,7 +328,6 @@ func rateLimitMiddleware(rl *RateLimiter, next http.Handler) http.Handler {
 	})
 }
 
-// loggingMiddleware はHTTPリクエストをログ出力するミドルウェア
 func loggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
@@ -353,7 +338,6 @@ func loggingMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-// responseWriter はステータスコードをキャプチャするためのラッパー
 type responseWriter struct {
 	http.ResponseWriter
 	statusCode int
@@ -381,11 +365,9 @@ func main() {
 	defer db.Close()
 
 	store := NewStore(baseURL, db)
-	// レート制限: 1分間に60リクエストまで
 	rateLimiter := NewRateLimiter(60, time.Minute)
 	mux := http.NewServeMux()
 
-	// Root - serve frontend
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
@@ -395,12 +377,20 @@ func main() {
 		w.Write(indexHTML)
 	})
 
-	// Health check
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+		ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+		defer cancel()
+		dbStatus := "ok"
+		if err := db.PingContext(ctx); err != nil {
+			dbStatus = "error"
+		}
+		status := "ok"
+		if dbStatus != "ok" {
+			status = "degraded"
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"status": status, "db": dbStatus})
 	})
 
-	// Shorten URL（レート制限適用）
 	shortenHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
@@ -434,7 +424,6 @@ func main() {
 	})
 	mux.Handle("/api/shorten", rateLimitMiddleware(rateLimiter, shortenHandler))
 
-	// Redirect
 	mux.HandleFunc("/r/", func(w http.ResponseWriter, r *http.Request) {
 		code := r.URL.Path[len("/r/"):]
 		if code == "" {
@@ -451,7 +440,6 @@ func main() {
 		http.Redirect(w, r, originalURL, http.StatusTemporaryRedirect)
 	})
 
-	// Stats
 	mux.HandleFunc("/api/stats", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
@@ -473,7 +461,6 @@ func main() {
 		writeJSON(w, http.StatusOK, stats)
 	})
 
-	// Single URL stats
 	mux.HandleFunc("/api/stats/", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
@@ -488,6 +475,32 @@ func main() {
 		writeJSON(w, http.StatusOK, entry)
 	})
 
-	log.Printf("URL Shortener API server starting on port %s", port)
-	log.Fatal(http.ListenAndServe(":"+port, loggingMiddleware(mux)))
+	srv := &http.Server{
+		Addr:         ":" + port,
+		Handler:      loggingMiddleware(mux),
+		ReadTimeout:  10 * time.Second,
+		WriteTimeout: 30 * time.Second,
+		IdleTimeout:  60 * time.Second,
+	}
+
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+
+	go func() {
+		log.Printf("URL Shortener API server starting on port %s", port)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Fatalf("Failed to start server: %v", err)
+		}
+	}()
+
+	<-quit
+	log.Println("Shutting down server...")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	if err := srv.Shutdown(ctx); err != nil {
+		log.Fatalf("Server forced to shutdown: %v", err)
+	}
+	log.Println("Server stopped gracefully")
 }
