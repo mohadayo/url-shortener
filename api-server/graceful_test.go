@@ -31,3 +31,27 @@ func TestMaxURLLengthConstant(t *testing.T) {
 		t.Errorf("expected maxURLLength=2048, got %d", maxURLLength)
 	}
 }
+
+func TestValidShortCode(t *testing.T) {
+	tests := []struct {
+		code  string
+		valid bool
+	}{
+		{"abcdef12", true},
+		{"00112233", true},
+		{"aabbccdd", true},
+		{"", false},
+		{"short", false},
+		{"toolongcode123", false},
+		{"ABCDEF12", false},
+		{"abcdefg!", false},
+		{"../../../", false},
+		{"abcdefgh", false},
+	}
+	for _, tc := range tests {
+		got := validShortCode.MatchString(tc.code)
+		if got != tc.valid {
+			t.Errorf("validShortCode(%q) = %v, want %v", tc.code, got, tc.valid)
+		}
+	}
+}
