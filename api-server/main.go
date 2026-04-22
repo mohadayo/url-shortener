@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"regexp"
 	"net/http"
 	"net/url"
 	"os"
@@ -26,6 +27,8 @@ import (
 var indexHTML []byte
 
 const maxURLLength = 2048
+
+var validShortCode = regexp.MustCompile(`^[a-f0-9]{8}$`)
 
 type URLEntry struct {
 	OriginalURL string    `json:"original_url"`
@@ -468,6 +471,10 @@ func main() {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "short code required"})
 			return
 		}
+		if !validShortCode.MatchString(code) {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid short code format"})
+			return
+		}
 
 		originalURL, ok := store.Resolve(code)
 		if !ok {
@@ -507,6 +514,10 @@ func main() {
 			return
 		}
 		code := r.URL.Path[len("/api/stats/"):]
+		if !validShortCode.MatchString(code) {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid short code format"})
+			return
+		}
 		entry, ok := store.GetEntry(code)
 		if !ok {
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "short url not found"})
