@@ -362,6 +362,18 @@ func rateLimitMiddleware(rl *RateLimiter, next http.Handler) http.Handler {
 	})
 }
 
+const maxRequestBodySize = 1 << 20 // 1MB
+
+// maxBodySizeMiddleware はリクエストボディのサイズを制限するミドルウェア
+func maxBodySizeMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost || r.Method == http.MethodPut {
+			r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodySize)
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
 // loggingMiddleware はHTTPリクエストをログ出力するミドルウェア
 func loggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -527,11 +539,12 @@ func main() {
 	})
 
 	srv := &http.Server{
-		Addr:         ":" + port,
-		Handler:      loggingMiddleware(mux),
-		ReadTimeout:  10 * time.Second,
-		WriteTimeout: 30 * time.Second,
-		IdleTimeout:  60 * time.Second,
+		Addr:              ":" + port,
+		Handler:           maxBodySizeMiddleware(loggingMiddleware(mux)),
+		ReadTimeout:       10 * time.Second,
+		ReadHeaderTimeout: 5 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 
 	quit := make(chan os.Signal, 1)
