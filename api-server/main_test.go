@@ -621,3 +621,45 @@ func TestLoggingMiddleware(t *testing.T) {
 		t.Errorf("expected status 200, got %d", w.Code)
 	}
 }
+
+func TestMaxBodySizeMiddleware(t *testing.T) {
+	handler := maxBodySizeMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var data map[string]string
+		err := json.NewDecoder(r.Body).Decode(&data)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "body too large"})
+			return
+		}
+		writeJSON(w, http.StatusOK, data)
+	}))
+
+	t.Run("正常サイズのボディは通過する", func(t *testing.T) {
+		body := bytes.NewBufferString(`{"url":"https://example.com"}`)
+		req := httptest.NewRequest(http.MethodPost, "/api/shorten", body)
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Errorf("expected 200, got %d", w.Code)
+		}
+	})
+
+	t.Run("GETリクエストはボディサイズ制限を受けない", func(t *testing.T) {
+		getHandler := maxBodySizeMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+		}))
+		req := httptest.NewRequest(http.MethodGet, "/health", nil)
+		w := httptest.NewRecorder()
+		getHandler.ServeHTTP(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Errorf("expected 200, got %d", w.Code)
+		}
+	})
+}
+
+func TestMaxRequestBodySizeConstant(t *testing.T) {
+	if maxRequestBodySize != 1<<20 {
+		t.Errorf("expected maxRequestBodySize to be 1MB (1048576), got %d", maxRequestBodySize)
+	}
+}
