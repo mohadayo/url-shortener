@@ -152,6 +152,52 @@ class TestGetStats(unittest.TestCase):
             client.get_stats()
         self.assertIn("タイムアウト", str(ctx.exception))
 
+    @patch("client.requests.get")
+    def test_http_error_with_json_detail(self, mock_get):
+        """HTTPエラー時にJSONのerrorフィールドが含まれる"""
+        import requests
+        mock_resp = MagicMock()
+        mock_resp.status_code = 500
+        mock_resp.json.return_value = {"error": "内部エラー"}
+        http_err = requests.HTTPError(response=mock_resp)
+        mock_resp.raise_for_status.side_effect = http_err
+
+        mock_get.return_value = mock_resp
+
+        client = APIClient()
+        with self.assertRaises(APIError) as ctx:
+            client.get_stats()
+        self.assertIn("内部エラー", str(ctx.exception))
+        self.assertEqual(ctx.exception.status_code, 500)
+
+    @patch("client.requests.get")
+    def test_http_error_without_json(self, mock_get):
+        """HTTPエラーでレスポンスがJSONでない場合もエラーを返す"""
+        import requests
+        mock_resp = MagicMock()
+        mock_resp.status_code = 502
+        mock_resp.json.side_effect = ValueError("not json")
+        http_err = requests.HTTPError(response=mock_resp)
+        mock_resp.raise_for_status.side_effect = http_err
+
+        mock_get.return_value = mock_resp
+
+        client = APIClient()
+        with self.assertRaises(APIError) as ctx:
+            client.get_stats()
+        self.assertEqual(ctx.exception.status_code, 502)
+
+    @patch("client.requests.get")
+    def test_generic_request_exception(self, mock_get):
+        """汎用リクエスト例外をAPIErrorとして返す"""
+        from requests.exceptions import RequestException
+        mock_get.side_effect = RequestException("DNS resolution failed")
+
+        client = APIClient()
+        with self.assertRaises(APIError) as ctx:
+            client.get_stats()
+        self.assertIn("ネットワークエラー", str(ctx.exception))
+
 
 class TestGetUrlStats(unittest.TestCase):
     """get_url_stats メソッドのテスト"""
@@ -201,6 +247,45 @@ class TestGetUrlStats(unittest.TestCase):
         with self.assertRaises(APIError) as ctx:
             client.get_url_stats("abc12345")
         self.assertIn("接続できません", str(ctx.exception))
+
+    @patch("client.requests.get")
+    def test_timeout_error(self, mock_get):
+        """タイムアウト時にAPIErrorを返す"""
+        from requests.exceptions import Timeout
+        mock_get.side_effect = Timeout()
+
+        client = APIClient()
+        with self.assertRaises(APIError) as ctx:
+            client.get_url_stats("abc12345")
+        self.assertIn("タイムアウト", str(ctx.exception))
+
+    @patch("client.requests.get")
+    def test_http_error_without_json(self, mock_get):
+        """HTTPエラーでレスポンスがJSONでない場合もエラーを返す"""
+        import requests
+        mock_resp = MagicMock()
+        mock_resp.status_code = 500
+        mock_resp.json.side_effect = ValueError("not json")
+        http_err = requests.HTTPError(response=mock_resp)
+        mock_resp.raise_for_status.side_effect = http_err
+
+        mock_get.return_value = mock_resp
+
+        client = APIClient()
+        with self.assertRaises(APIError) as ctx:
+            client.get_url_stats("abc12345")
+        self.assertEqual(ctx.exception.status_code, 500)
+
+    @patch("client.requests.get")
+    def test_generic_request_exception(self, mock_get):
+        """汎用リクエスト例外をAPIErrorとして返す"""
+        from requests.exceptions import RequestException
+        mock_get.side_effect = RequestException("connection reset")
+
+        client = APIClient()
+        with self.assertRaises(APIError) as ctx:
+            client.get_url_stats("abc12345")
+        self.assertIn("ネットワークエラー", str(ctx.exception))
 
 
 class TestAPIError(unittest.TestCase):
